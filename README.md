@@ -2542,3 +2542,498 @@ The core design is:
 > **MSSQL executes it using a restricted read-only account.**
 
 > **Actual database data never needs to be sent to the AI.**
+
+
+
+
+
+
+
+Yes. You can build an inferred foreign-key graph at the application level without modifying the actual database.
+
+The important distinction is:
+
+Actual FK
+Database-enforced relationship
+        ↓
+SQL Server knows it is a relationship
+
+Inferred FK
+Application-detected probable relationship
+        ↓
+Your application stores/uses it as metadata
+
+For your database-schema analysis project, this is actually useful.
+
+How the algorithm can work
+
+Suppose you have:
+
+Users
+-----
+UserId       INT
+Name         VARCHAR
+Email        VARCHAR
+
+Orders
+------
+OrderId      INT
+UserId       INT
+Amount       DECIMAL
+
+Products
+--------
+ProductId    INT
+Name         VARCHAR
+
+There is no FK.
+
+Your algorithm can detect:
+
+Orders.UserId → Users.UserId
+
+because:
+
+1. Users.UserId looks like a primary/unique identifier.
+
+
+2. Orders.UserId has the same name.
+
+
+3. Data types match.
+
+
+4. Orders.UserId values largely exist in Users.UserId.
+
+
+5. Cardinality makes sense.
+
+
+6. Orders.UserId is not itself unique, which is consistent with many Orders → one User.
+
+
+
+You could store the result separately:
+
+{
+  "inferredRelationships": [
+    {
+      "fromTable": "Orders",
+      "fromColumn": "UserId",
+      "toTable": "Users",
+      "toColumn": "UserId",
+      "confidence": 0.98,
+      "reason": [
+        "same column name",
+        "same data type",
+        "target column is unique",
+        "95% of values have matching parent"
+      ]
+    }
+  ]
+}
+
+Don't rely only on column-name similarity
+
+This is the critical part.
+
+For example:
+
+Customer.CustomerId
+Order.CustomerId
+Invoice.CustomerId
+Payment.CustomerId
+
+Name similarity is strong evidence, but not proof.
+
+A better algorithm gives each candidate relationship a score.
+
+For example:
+
++30  exact/similar column name
++20  compatible data type
++20  referenced column is PK/unique
++20  high percentage of child values exist in parent
++10  child column is nullable in a plausible way
++10  naming pattern matches Id/Code conventions
+-30  incompatible cardinality
+-40  many unmatched values
+
+Then:
+
+90–100 → Very likely FK
+75–89  → Likely FK
+50–74  → Possible relationship
+<50    → Ignore
+
+The exact weights should be calibrated rather than treated as universal truths.
+
+Even better: distinguish relationship types
+
+You shouldn't store everything as simply:
+
+A → B
+
+Store:
+
+child_table
+child_column
+parent_table
+parent_column
+confidence
+evidence
+relationship_type
+
+For example:
+
+{
+  "child": "Orders.UserId",
+  "parent": "Users.UserId",
+  "confidence": 0.98,
+  "type": "inferred_foreign_key"
+}
+
+This gives you a virtual schema graph:
+
+Users
+               ↑
+               │ UserId
+               │
+             Orders
+               │
+               ↓
+            Products
+
+This is particularly useful for your Text-to-SQL system
+
+You previously discussed creating a schema graph for database understanding.
+
+Without declared FKs, your graph can have two layers:
+
+DATABASE SCHEMA
+│
+├── Actual relationships
+│   └── Declared FKs
+│
+└── Inferred relationships
+    └── Relationships discovered by your algorithm
+
+Then your LLM/retrieval system can use both.
+
+For example, a user asks:
+
+> "Show customers and their total orders."
+
+
+
+Your metadata can tell the system:
+
+Customers.CustomerId
+        ↓
+Orders.CustomerId
+
+even though SQL Server itself doesn't declare that FK.
+
+One major warning
+
+Do not automatically create real FKs based purely on inference.
+
+Store them as application metadata first.
+
+Because this:
+
+Orders.CustomerId → Customers.CustomerId
+
+might look obvious but could be wrong due to:
+
+legacy data
+
+duplicate IDs
+
+reused identifiers
+
+nullable columns
+
+composite keys
+
+inconsistent naming
+
+historical/archive tables
+
+polymorphic relationships
+
+columns that happen to share the same values
+
+
+So your system should say:
+
+Declared FK       = authoritative
+Inferred FK       = probabilistic
+
+That distinction is important for the schema graph you are building.
+
+
+
+
+
+
+
+Correct. Do not create actual FK constraints in SQL Server. You are creating a virtual/inferred relationship layer in your application.
+
+For your architecture, I would separate the data into two representations:
+
+1. Canonical relationship file
+
+Use JSON as the source of truth.
+
+For example:
+
+{
+  "relationships": [
+    {
+      "id": "orders_customerid__customers_customerid",
+      "from": {
+        "table": "Orders",
+        "column": "CustomerId"
+      },
+      "to": {
+        "table": "Customers",
+        "column": "CustomerId"
+      },
+      "type": "inferred_fk",
+      "confidence": 0.97,
+      "evidence": {
+        "name_similarity": 1.0,
+        "data_type_match": true,
+        "parent_is_unique": true,
+        "value_match_ratio": 0.99
+      }
+    }
+  ]
+}
+
+This JSON is your canonical structured representation.
+
+Don't make Qdrant the primary storage for this information.
+
+
+---
+
+2. Chunks for Qdrant
+
+Generate textual/structured chunks from those relationships.
+
+For example:
+
+Relationship:
+Orders.CustomerId → Customers.CustomerId
+
+Type: inferred foreign key
+Confidence: 0.97
+
+Evidence:
+- Column names match
+- Data types match
+- Customers.CustomerId is unique
+- 99% of Orders.CustomerId values exist in Customers.CustomerId
+
+Relationship semantics:
+Each Order likely belongs to one Customer.
+A Customer can have many Orders.
+
+Embed that chunk and store it in Qdrant.
+
+Qdrant then becomes the retrieval layer, not the authoritative database.
+
+
+---
+
+Architecture
+
+SQL Server
+                    │
+                    │ schema extraction
+                    ▼
+             Schema Analyzer
+                    │
+          ┌─────────┴─────────┐
+          ▼                   ▼
+    Actual metadata      Relationship
+    PK / columns         inference engine
+                              │
+                              ▼
+                    inferred_relationships.json
+                              │
+                              ▼
+                       Chunk generator
+                              │
+                              ▼
+                           Qdrant
+                              │
+                              ▼
+                         LLM retrieval
+
+Why JSON is better than storing only chunks
+
+Your algorithm will probably evolve.
+
+Today:
+
+Orders.CustomerId → Customers.CustomerId
+confidence = 0.97
+
+Tomorrow you might improve your algorithm and get:
+
+confidence = 0.91
+
+Or discover:
+
+Orders.CustomerId → Customers.CustomerId
+Orders.BillingCustomerId → Customers.CustomerId
+Orders.ShippingCustomerId → Customers.CustomerId
+
+You want to be able to recalculate and regenerate the Qdrant chunks without losing the original relationship data.
+
+So:
+
+JSON = source of truth
+Qdrant = searchable/vector representation
+
+
+---
+
+You can also chunk by relationship
+
+Don't create one giant relationship JSON chunk.
+
+For a large database:
+
+relationships/
+    Orders__CustomerId__Customers__CustomerId.json
+    Orders__ProductId__Products__ProductId.json
+    Invoice__CustomerId__Customers__CustomerId.json
+    ...
+
+Or, more efficiently, maintain one canonical JSON file/database and generate chunks dynamically.
+
+For your use case, I'd use:
+
+schema/
+    tables.json
+    columns.json
+    relationships.json
+
+Then:
+
+qdrant/
+    table chunks
+    column chunks
+    relationship chunks
+
+The relationship chunks should contain the actual table/column names plus evidence and confidence, because those are what the LLM needs when deciding how to construct a JOIN.
+
+One important addition: store an inference algorithm version with each relationship:
+
+{
+  "algorithm_version": "fk-inference-v2",
+  "confidence": 0.97
+}
+
+That lets you regenerate relationships when the inference logic changes without confusing old and new results.
+
+
+
+
+
+
+
+No. A temporary .txt file is not necessary.
+
+For your pipeline, generate chunks in memory and send them directly to Qdrant.
+
+SQL Server
+   ↓
+Extract schema
+   ↓
+Infer relationships
+   ↓
+Create relationship objects
+   ↓
+Generate chunks in memory
+   ↓
+Create embeddings
+   ↓
+Qdrant
+
+For example, in .NET:
+
+var relationship = new Relationship
+{
+    FromTable = "Orders",
+    FromColumn = "CustomerId",
+    ToTable = "Customers",
+    ToColumn = "CustomerId",
+    Confidence = 0.97
+};
+
+string chunk = GenerateChunk(relationship);
+
+var embedding = await GenerateEmbedding(chunk);
+
+await qdrant.UpsertAsync(
+    collectionName,
+    embedding,
+    payload: new
+    {
+        type = "inferred_relationship",
+        from_table = relationship.FromTable,
+        from_column = relationship.FromColumn,
+        to_table = relationship.ToTable,
+        to_column = relationship.ToColumn,
+        confidence = relationship.Confidence
+    });
+
+No .txt file exists at any point.
+
+But keep the JSON?
+
+Yes, if you want reproducibility and easy regeneration.
+
+Use:
+
+schema/
+    tables.json
+    columns.json
+    relationships.json
+
+Then:
+
+relationships.json
+       ↓
+  chunk generator
+       ↓
+    embeddings
+       ↓
+     Qdrant
+
+The JSON is your canonical metadata.
+
+Qdrant is your retrieval/index layer.
+
+What if you don't need persistence?
+
+If your application can regenerate everything from SQL Server whenever needed, even relationships.json isn't strictly required:
+
+SQL Server
+   ↓
+Inference
+   ↓
+Memory
+   ↓
+Chunks
+   ↓
+Qdrant
+
+For your Text-to-SQL system, though, I would keep the JSON. It gives you a clean way to inspect, debug, version, compare and regenerate the inferred relationship graph.
+
+Don't use temporary TXT files just to create embeddings. That adds an unnecessary disk I/O step.
