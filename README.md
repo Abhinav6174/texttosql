@@ -3037,3 +3037,208 @@ Qdrant
 For your Text-to-SQL system, though, I would keep the JSON. It gives you a clean way to inspect, debug, version, compare and regenerate the inferred relationship graph.
 
 Don't use temporary TXT files just to create embeddings. That adds an unnecessary disk I/O step.
+
+
+
+
+
+
+
+
+
+
+
+Yes. This is exactly where simple column-name similarity becomes insufficient.
+
+What you are describing is a semantic/business relationship, not necessarily a database FK.
+
+For example:
+
+MasterStatus
+-----------
+Id    Text
+1     Active
+2     Deleted
+3     Pending
+
+And:
+
+Orders
+------
+OrderId
+StatusId
+
+The application interprets:
+
+Orders.StatusId = 1  → Active
+Orders.StatusId = 2  → Deleted
+
+There may be no FK at all:
+
+Orders.StatusId
+       X
+MasterStatus.Id
+
+But logically there is a relationship:
+
+Orders.StatusId
+       ↓
+MasterStatus.Id
+
+Your master category makes this more interesting
+
+Suppose:
+
+MasterCategory
+--------------
+CategoryId
+CategoryName
+
+MasterValue
+-----------
+Id
+CategoryId
+Text
+
+Data:
+
+CategoryId = 10 → OrderStatus
+
+MasterValue
+Id   CategoryId   Text
+1    10           Active
+2    10           Deleted
+3    10           Pending
+
+Then:
+
+Orders.StatusId = 1
+
+doesn't merely mean:
+
+Orders.StatusId → MasterValue.Id
+
+It means:
+
+Orders.StatusId
+      ↓
+MasterValue.Id
+      ↓
+MasterValue.CategoryId = 10
+      ↓
+MasterCategory = OrderStatus
+
+That category constraint is part of the business semantics.
+
+Therefore your inferred graph should have more than FK relationships
+
+I'd model at least three relationship types:
+
+1. DECLARED_FK
+   Actual SQL foreign key
+
+2. INFERRED_FK
+   Strong structural relationship inferred from schema/data
+
+3. BUSINESS_REFERENCE
+   Application/business relationship that may not be represented by SQL constraints
+
+Your example is primarily:
+
+Orders.StatusId
+      │
+      └── BUSINESS_REFERENCE ──→ MasterValue.Id
+                                      │
+                                      └── category → OrderStatus
+
+This matters enormously for Text-to-SQL
+
+Suppose the user asks:
+
+> Show all deleted orders.
+
+
+
+The LLM needs to understand:
+
+"deleted"
+   ↓
+OrderStatus category
+   ↓
+MasterValue.Id = 2
+   ↓
+Orders.StatusId = 2
+
+If you only build your schema graph from actual FKs, the relationship disappears.
+
+If you only use column-name similarity, you may also miss it because:
+
+Orders.StatusId
+MasterValue.Id
+
+have completely different names.
+
+Your inference system therefore needs to examine data + schema + application semantics, not just names.
+
+A useful metadata representation
+
+Store something like:
+
+{
+  "type": "business_reference",
+  "from": {
+    "table": "Orders",
+    "column": "StatusId"
+  },
+  "to": {
+    "table": "MasterValue",
+    "column": "Id"
+  },
+  "category": {
+    "table": "MasterCategory",
+    "column": "CategoryId",
+    "value": "OrderStatus"
+  },
+  "meaning": "Orders.StatusId references the MasterValue belonging to the OrderStatus category"
+}
+
+Then your Qdrant chunk can express the semantic rule:
+
+Orders.StatusId is a business reference to MasterValue.Id.
+
+Only MasterValue records belonging to the "OrderStatus"
+category should be considered valid status values.
+
+OrderStatus values:
+1 = Active
+2 = Deleted
+3 = Pending
+
+That is much more useful to the LLM than merely saying:
+
+Orders.StatusId → MasterValue.Id
+
+One more important distinction
+
+Don't call every such relationship a "foreign key."
+
+Use relationship as the generic concept:
+
+Relationship
+├── Declared FK
+├── Inferred FK
+├── Business reference
+├── Lookup/reference
+├── Join relationship
+└── Semantic relationship
+
+Then your schema graph becomes a business-aware database graph, rather than merely a copy of SQL Server's FK metadata.
+
+For the system you're building, this is the right direction because many legacy/enterprise databases encode relationships through conventions and business logic instead of database constraints.
+
+
+so we mostly use them for statusid, substatusid, queueid, reason id, etc.... but we can't determine them correctly for every table...
+
+
+
+
