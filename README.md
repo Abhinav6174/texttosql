@@ -3242,3 +3242,239 @@ so we mostly use them for statusid, substatusid, queueid, reason id, etc.... but
 
 
 
+## multi database architecture
+
+
+No. You do not need one Qdrant collection per database. Both designs are valid, but for your multi-database Text-to-SQL system, I would generally start with one collection + database-level filtering.
+
+Recommended design
+
+Qdrant
+└── schema_embeddings
+    ├── DB1 → Customers
+    ├── DB1 → Orders
+    ├── DB1 → Products
+    ├── DB2 → Employees
+    ├── DB2 → Departments
+    └── DB3 → Transactions
+
+Each vector payload must identify its database.
+
+{
+  "database_id": "SalesDB",
+  "schema_name": "dbo",
+  "object_name": "Orders",
+  "object_type": "table",
+  "content": "Table Orders stores customer orders..."
+}
+
+Then search with a filter:
+
+User question
+    ↓
+Selected database = SalesDB
+    ↓
+Qdrant vector search
+    ↓
+Filter database_id = SalesDB
+    ↓
+Relevant schema chunks
+
+This prevents schema from another database being retrieved.
+
+
+---
+
+Why one collection is usually better
+
+1. Easier management
+
+One collection
+One embedding configuration
+One indexing strategy
+One backup
+One monitoring setup
+
+Instead of:
+
+SalesDB_collection
+HRDB_collection
+FinanceDB_collection
+InventoryDB_collection
+...
+
+2. Easier scaling
+
+If you add 100 databases, you do not need to dynamically create and manage 100 collections.
+
+3. Shared schema retrieval infrastructure
+
+Your .NET code remains:
+
+SearchSchemaAsync(
+    databaseId,
+    userQuestion
+);
+
+rather than selecting a collection dynamically.
+
+
+---
+
+When separate collections make sense
+
+Use separate collections if databases are significantly different in nature or have strict isolation requirements.
+
+For example:
+
+Collection: production_schema
+Collection: analytics_schema
+Collection: development_schema
+
+Or if different databases use:
+
+Different embedding models
+Different vector dimensions
+Different retention policies
+Different access-control boundaries
+
+But database separation alone is not a strong reason to create separate collections.
+
+
+---
+
+Important: Your schema graph must also be database-specific
+
+This is more important than Qdrant collection separation.
+
+Do not build:
+
+Global graph:
+Customers → Orders → Products
+Employees → Departments
+
+without database identity.
+
+Instead:
+
+Graph Key = DatabaseId + TableName
+
+Example:
+
+SalesDB.dbo.Customers
+SalesDB.dbo.Orders
+
+HRDB.dbo.Employees
+HRDB.dbo.Departments
+
+Because two databases may both contain:
+
+dbo.Customers
+
+but they are completely different tables.
+
+Your graph node should be:
+
+public class TableNode
+{
+    public string DatabaseId { get; set; } = string.Empty;
+    public string SchemaName { get; set; } = string.Empty;
+    public string TableName { get; set; } = string.Empty;
+}
+
+Or use a unique key:
+
+string nodeKey = $"{databaseId}.{schemaName}.{tableName}";
+
+Example:
+
+SalesDB.dbo.Orders
+
+
+---
+
+Recommended complete multi-database architecture
+
+User
+                     │
+                     ▼
+             Select Database
+                     │
+                     ▼
+              .NET API
+                     │
+          ┌──────────┴──────────┐
+          ▼                     ▼
+     Qdrant Search         Schema Graph
+          │                     │
+          │ database filter     │ database-specific
+          ▼                     ▼
+     Relevant Tables      Relationship Expansion
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+              Final Schema
+                     │
+                     ▼
+                    AI
+                     │
+                     ▼
+             Generated SQL
+                     │
+                     ▼
+       Validate against selected DB
+                     │
+                     ▼
+       Execute on selected DB only
+
+
+---
+
+One critical security rule
+
+Never let the AI choose the database connection string.
+
+The application should determine it:
+
+User selects SalesDB
+        ↓
+.NET resolves SalesDB connection
+        ↓
+Schema retrieval filtered to SalesDB
+        ↓
+SQL validation against SalesDB schema
+        ↓
+Execute using SalesDB read-only credentials
+
+Not:
+
+AI:
+"I think this query should run against FinanceDB"
+
+The database context must be controlled by your application.
+
+
+---
+
+My recommendation
+
+Use:
+
+Qdrant:
+    One collection: schema_embeddings
+
+Payload:
+    database_id
+    schema_name
+    object_name
+    object_type
+    content
+
+.NET:
+    One SchemaGraph per database
+    OR one global graph keyed by database-qualified table names
+
+SQL execution:
+    Separate connection per selected database
+
+For your project, one Qdrant collection with database_id filtering + database-aware graph traversal is the cleanest architecture.
